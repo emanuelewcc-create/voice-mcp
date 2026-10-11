@@ -13,9 +13,12 @@
     "ELEVENLABS_VOICE_ID": "7Pd7lr5kXhWerGi0OVF0",
     "ELEVENLABS_MODEL_ID": "eleven_v4",
     "ELEVENLABS_STABILITY": "0.35",
+    "ELEVENLABS_STABILITY_ZH": "0.25",
+    "ELEVENLABS_DELIVERY_ZH": "relaxed, conversational, unhurried",
     "VOICE_SFX_URL": "https://haven.rain4haven99.cyou/api/voice-sfx/mix"
   },
   "observability": {
     "enabled": true
   }
 }
+
