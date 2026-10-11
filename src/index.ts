@@ -2526,6 +2526,29 @@ function buildDashScopeText(input: SpeakInput): string {
   return stripAudioTags(input.text);
 }
 
+// Chinese aliases describe everyday delivery rather than standalone vocal effects.
+// Other languages continue to use the original style mapping.
+const CHINESE_STYLE_DIRECTIONS: Record<string, string> = {
+  soft: "gentle, soft-spoken conversation",
+  teasing: "lightly playful, affectionate",
+  excited: "spontaneously pleased",
+  tired: "sleepy, easygoing",
+  laughing: "speaking with a small smile",
+  curious: "gently curious",
+};
+
+function getChineseStyleDirection(style?: string): string | undefined {
+  if (!style?.trim()) return undefined;
+  // Accept the plugin's style field with or without brackets. Collapse duplicate
+  // directions into one cue; never concatenate the spoken text into this field.
+  const parts = style.replace(/[\[\]]/g, ";").split(";")
+    .map((part) => part.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const unique = parts.filter((part, index) =>
+    parts.findIndex((other) => other.toLowerCase() === part.toLowerCase()) === index);
+  const direction = unique.join("; ");
+  return CHINESE_STYLE_DIRECTIONS[direction.toLowerCase()] || direction || undefined;
+}
+
 function buildElevenLabsText(env: Env, input: SpeakInput): string {
   const modelId = getElevenLabsModel(env);
   const inputText = stripVoiceSfxDirectives(input.text);
@@ -2534,22 +2557,32 @@ function buildElevenLabsText(env: Env, input: SpeakInput): string {
     return stripAudioTags(inputText);
   }
 
-  if (input.raw_tags === true && /\[[^\]\r\n]*\]/.test(inputText)) {
+  if ((input.raw_tags === true || (input.raw_tags !== false && env.ELEVENLABS_DELIVERY_ZH && usesChineseDelivery(input)))
+      && /\[[^\]\r\n]*\]/.test(inputText)) {
     return inputText;
+  }
+
+  const chineseProfile = env.ELEVENLABS_DELIVERY_ZH?.trim();
+  if (chineseProfile && usesChineseDelivery(input)) {
+    // Keep speech intact. Directions belong in style for Chinese calls. Raw,
+    // position-specific tags still take precedence via the early return above.
+    const text = input.raw_tags === false
+      ? inputText.replace(/\[[A-Za-z][^\]\r\n]*\]/g, "").trim()
+      : inputText;
+    const style = getChineseStyleDirection(input.style);
+    const directions = [
+      input.raw_tags !== false ? chineseProfile : undefined,
+      style,
+    ].filter((part): part is string => Boolean(part));
+    const unique = directions.filter((part, index) =>
+      directions.findIndex((other) => other.toLowerCase() === part.toLowerCase()) === index);
+    return unique.length ? `[${unique.join("; ")}] ${text}` : text;
   }
 
   const text = input.raw_tags === true ? inputText : stripAudioTags(inputText);
   const tag = input.raw_tags !== true && input.style ? ELEVENLABS_STYLE_TAGS[input.style.trim().toLowerCase()] : undefined;
 
-  const directedText = tag ? `${tag} ${text}` : text;
-  // Caller-supplied styles/tags take priority. An explicit false opts out of the
-  // fallback, so neutral readings remain possible without changing the voice.
-  const direction = env.ELEVENLABS_DELIVERY_ZH?.trim();
-  if (direction && input.raw_tags !== false && !input.style?.trim()
-      && usesChineseDelivery(input) && !/\[[^\]\r\n]*\]/.test(inputText)) {
-    return `[${direction}] ${directedText}`;
-  }
-  return directedText;
+  return tag ? `${tag} ${text}` : text;
 }
 
 function arrayBufferToBase64(arrayBuffer: ArrayBuffer): string {
@@ -3161,10 +3194,10 @@ function createVoiceServer(env: Env, origin: string): McpServer {
     "speak",
     {
       title: `${botName}'s Voice`,
-      description: `Make ${botName} speak with a custom cloned voice. The audio will play in an inline player.`,
+      description: `Make ${botName} speak with the configured voice. The audio will play in an inline player. For Chinese, use natural everyday wording and put a brief delivery direction in style, leaving text as the words to say. The Chinese preset favors relaxed, private conversation. Do not request narrator/actor delivery or add repeated names, warm-up syllables, forced breaths or laughs. Do not repeat a successful call just to obtain a different delivery.`,
       inputSchema: z.object({
-        text: z.string().describe("Text to speak"),
-        style: z.string().optional().describe("Optional speaking style"),
+        text: z.string().describe("Words to speak exactly once. For Chinese, prefer plain dialogue; put delivery guidance in style rather than adding a lead-in or repeating the first word."),
+        style: z.string().optional().describe("For Chinese: a short delivery-only direction, preferably in English, e.g. gentle and affectionate. Do not include dialogue, speaker names or quoted words. Omit to use the Chinese conversational preset. For other languages: soft, teasing, excited, tired, laughing or curious."),
         raw_tags: z.boolean().optional().describe("Allow raw ElevenLabs v3/v4 audio tags when supported"),
       }),
       _meta: {
