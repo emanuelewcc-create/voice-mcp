@@ -2534,12 +2534,12 @@ function buildElevenLabsText(env: Env, input: SpeakInput): string {
     return stripAudioTags(inputText);
   }
 
-  if (input.raw_tags === true) {
+  if (input.raw_tags === true && /\[[^\]\r\n]*\]/.test(inputText)) {
     return inputText;
   }
 
-  const text = stripAudioTags(inputText);
-  const tag = input.style ? ELEVENLABS_STYLE_TAGS[input.style.trim().toLowerCase()] : undefined;
+  const text = input.raw_tags === true ? inputText : stripAudioTags(inputText);
+  const tag = input.raw_tags !== true && input.style ? ELEVENLABS_STYLE_TAGS[input.style.trim().toLowerCase()] : undefined;
 
   const directedText = tag ? `${tag} ${text}` : text;
   // Caller-supplied styles/tags take priority. An explicit false opts out of the
