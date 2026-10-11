@@ -3394,11 +3394,11 @@ function createVoiceServer(env: Env, origin: string): McpServer {
     "speak",
     {
       title: `${botName}'s Voice`,
-      description: `Make ${botName} speak with the configured voice. The audio will play in an inline player. For Chinese, use natural everyday wording and put a brief delivery direction in style, leaving text as the words to say. The Chinese preset favors relaxed, private conversation. Do not request narrator/actor delivery or add repeated names, warm-up syllables, forced breaths or laughs. Do not repeat a successful call just to obtain a different delivery.`,
+      description: `Make ${botName} speak with a custom cloned voice. The audio will play in an inline player.`,
       inputSchema: z.object({
-        text: z.string().describe("Words to speak exactly once. For Chinese, prefer plain dialogue; put delivery guidance in style rather than adding a lead-in or repeating the first word."),
-        style: z.string().optional().describe("For close, expressive Chinese conversation use natural_close_zh (alias: intimate_zh). This server preset adds close soft speech, light breath, relaxed articulation, natural pauses and a subtle teasing smile to the existing voice. Pass plain dialogue as text. Custom Chinese style is limited to 120 characters; never send directing paragraphs. Omit for the generic Chinese default. Other languages retain soft, teasing, excited, tired, laughing or curious."),
-        raw_tags: z.boolean().optional().describe("Control audio tags in text. false removes caller-written tags; it does not disable an explicit style or server preset. Named Chinese presets work with plain text and raw_tags=false. Explicit positional tags take precedence when allowed."),
+        text: z.string().describe("Text to speak"),
+        style: z.string().optional().describe("Optional speaking style. Chinese only: natural_close_zh (alias: intimate_zh) selects the close conversational preset with light breath, relaxed articulation, natural pauses and a subtle teasing smile. Custom Chinese style is limited to 120 characters. These Chinese presets and limits do not apply to English or Japanese."),
+        raw_tags: z.boolean().optional().describe("Allow raw ElevenLabs v3/v4 audio tags when supported"),
       }),
       _meta: {
         ui: { resourceUri: VOICE_RESOURCE_URI },
