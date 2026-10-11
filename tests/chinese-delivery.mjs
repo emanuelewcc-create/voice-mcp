@@ -101,7 +101,7 @@ test("deployed Chinese defaults are bounded and retain the configured identity",
     const request = w.requests.at(-1);
     assert.match(request.url, /7Pd7lr5kXhWerGi0OVF0/);
     assert.equal(request.body.model_id, "eleven_v4");
-    assert.equal(request.body.voice_settings.stability, 0.35);
+    assert.equal(request.body.voice_settings.stability, 0.40);
     assert.ok([...request.body.text.matchAll(/\[([^\]]*)\]/g)].every(tag => tag[1].length <= 160));
   }
 });
