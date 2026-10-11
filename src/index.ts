@@ -110,14 +110,14 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v2.html";
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
 
 // =============================================================================
 // Audio Player HTML (WeChat-style UI)
 // =============================================================================
 
-function getPlayerHTML(botName: string): string {
+function getPlayerHTML(botName: string, origin = "https://voice-mcp.qianzhi-cloud.workers.dev"): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -247,6 +247,7 @@ function getPlayerHTML(botName: string): string {
     const BOT_NAME = '${botName}';
     let audio = null;
     let waveInterval = null;
+    let audioObjectUrl = null;
     
     function escapeHtml(text) {
       const div = document.createElement('div');
@@ -259,6 +260,7 @@ function getPlayerHTML(botName: string): string {
     }
     
     function formatTime(sec) {
+      if (!Number.isFinite(sec) || sec < 0) return '--:--';
       const m = Math.floor(sec / 60);
       const s = Math.floor(sec % 60);
       return m + ':' + (s < 10 ? '0' : '') + s;
@@ -269,12 +271,39 @@ function getPlayerHTML(botName: string): string {
       return heights.map(h => '<div class="wave-bar" style="height:' + h + '%"></div>').join('');
     }
     
-    function renderPlayer(text, audioBase64) {
-      const audioUrl = 'data:audio/mpeg;base64,' + audioBase64;
+    function renderPlayer(text, data) {
+      if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
+      audioObjectUrl = null;
+      let fallbackUrl = '';
+      try {
+        const candidate = new URL(data.audio_url);
+        if (candidate.origin === ${JSON.stringify(origin)} && /^\\/audio\\/[a-f0-9]{64}$/.test(candidate.pathname)) {
+          fallbackUrl = candidate.href;
+        }
+      } catch (_error) {}
+      let audioUrl = fallbackUrl;
+      // Decode the whole payload first, so the browser sees a finite binary
+      // resource rather than a potentially truncated or unbounded data URL.
+      try {
+        const encoded = (data.audio_base64 || '').replace(/\\s/g, '');
+        if (!encoded || encoded.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw Error('Invalid base64');
+        const binary = atob(encoded);
+        if (Number.isFinite(data.audio_byte_length) && binary.length !== data.audio_byte_length) throw Error('Incomplete audio');
+        if (!binary.length) throw Error('Empty audio');
+        const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+        const mime = /^audio\\/[a-z0-9.+-]+$/i.test(data.audio_mime_type || '') ? data.audio_mime_type : 'audio/mpeg';
+        audioObjectUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
+        audioUrl = audioObjectUrl;
+      } catch (_error) {
+        if (!fallbackUrl) {
+          showError('音频数据不完整，暂时无法播放。请勿反复生成。');
+          return;
+        }
+      }
       
       contentEl.innerHTML = 
         '<div class="player">' +
-          '<button class="play-btn" id="playBtn">' +
+          '<button class="play-btn" id="playBtn" aria-label="播放或暂停">' +
             '<svg viewBox="0 0 24 24"><path id="playIcon" d="M8 5v14l11-7z"/></svg>' +
           '</button>' +
           '<div class="waveform" id="waveform">' + createWaveform() + '</div>' +
@@ -284,9 +313,13 @@ function getPlayerHTML(botName: string): string {
           '<span class="arrow">▶</span> Show transcript' +
         '</button>' +
         '<div class="text-bubble" id="textBubble">' + escapeHtml(text) + '</div>' +
-        '<audio id="audio" src="' + audioUrl + '" preload="metadata"></audio>';
+        '<div id="playbackError" class="error" role="status"></div>' +
+        '<audio id="audio" preload="auto" playsinline></audio>';
       
       audio = document.getElementById('audio');
+      const currentAudio = audio;
+      let usingFallback = audioUrl === fallbackUrl;
+      const errorEl = document.getElementById('playbackError');
       const playBtn = document.getElementById('playBtn');
       const playIcon = document.getElementById('playIcon');
       const durationEl = document.getElementById('duration');
@@ -295,13 +328,38 @@ function getPlayerHTML(botName: string): string {
       const toggleBtn = document.getElementById('toggleBtn');
       const textBubble = document.getElementById('textBubble');
       
-      audio.addEventListener('loadedmetadata', function() {
-        durationEl.textContent = formatTime(audio.duration);
+      function updateDuration() {
+        const duration = currentAudio.duration;
+        durationEl.textContent = Number.isFinite(duration) && duration > 0
+          ? formatTime(duration) : formatTime(currentAudio.currentTime || 0) + ' / --:--';
+      }
+      ['loadedmetadata', 'durationchange', 'loadeddata'].forEach(function(name) {
+        currentAudio.addEventListener(name, updateDuration);
       });
+      function playbackFailure(error) {
+        if (audio !== currentAudio) return;
+        if (!usingFallback && fallbackUrl && (!error || error.name !== 'NotAllowedError')) {
+          usingFallback = true;
+          currentAudio.src = fallbackUrl;
+          currentAudio.load();
+          errorEl.textContent = '已切换到原始音频，请再点播放。';
+          return;
+        }
+        const code = currentAudio.error && currentAudio.error.code;
+        errorEl.textContent = error && error.name === 'NotAllowedError'
+          ? '请点播放按钮开始播放。'
+          : '音频加载或解码失败' + (code ? '（错误 ' + code + '）' : '') + '。请勿反复生成。';
+        notifySize();
+      }
+      currentAudio.addEventListener('error', function() { playbackFailure(); });
+      currentAudio.addEventListener('canplay', function() { errorEl.textContent = ''; });
+      currentAudio.src = audioUrl;
+      currentAudio.load();
       
       playBtn.addEventListener('click', function() {
         if (audio.paused) {
-          audio.play();
+          const attempt = currentAudio.play();
+          if (attempt && typeof attempt.catch === 'function') attempt.catch(playbackFailure);
         } else {
           audio.pause();
         }
@@ -327,7 +385,9 @@ function getPlayerHTML(botName: string): string {
       });
       
       audio.addEventListener('timeupdate', function() {
-        const progress = audio.currentTime / audio.duration;
+        const progress = Number.isFinite(currentAudio.duration) && currentAudio.duration > 0
+          ? currentAudio.currentTime / currentAudio.duration : 0;
+        if (!Number.isFinite(currentAudio.duration)) updateDuration();
         const activeCount = Math.floor(progress * bars.length);
         bars.forEach((b, i) => b.classList.toggle('active', i < activeCount));
       });
@@ -373,13 +433,14 @@ function getPlayerHTML(botName: string): string {
         notifySize();
         return;
       }
-      if (typeof data.audio_base64 === 'string' && data.audio_base64 && typeof data.text === 'string') {
+      if ((data.audio_base64 || data.audio_url) && typeof data.text === 'string') {
         completed = true;
-        if (lastAudio === data.audio_base64) return;
-        lastAudio = data.audio_base64;
+        const identity = data.audio_url || data.audio_base64;
+        if (lastAudio === identity) return;
+        lastAudio = identity;
         if (audio) audio.pause();
         if (waveInterval) clearInterval(waveInterval);
-        renderPlayer(data.text, data.audio_base64);
+        renderPlayer(data.text, data);
         notifySize();
       }
     }
@@ -428,7 +489,7 @@ function getPlayerHTML(botName: string): string {
       new ResizeObserver(notifySize).observe(document.body);
     }
     sendToHost('ui/initialize', {
-      appInfo: { name: 'voice-mcp', version: '1.0.1' },
+      appInfo: { name: 'voice-mcp', version: '1.0.2' },
       appCapabilities: { availableDisplayModes: ['inline'] },
       protocolVersion: '2026-01-26'
     }, 1);
@@ -2944,6 +3005,13 @@ export class VoiceAudioCache extends DurableObject<Env> {
   private pending?: Promise<AudioResult>;
 
   async fetch(request: Request): Promise<Response> {
+    // This route is strictly read-only: a missing recording must never synthesize.
+    if ((request.method === "GET" || request.method === "HEAD") && new URL(request.url).pathname === "/audio") {
+      const cached = await this.readCached();
+      if (!cached?.success || !cached.audio_base64) return new Response("Audio not found", { status: 404, headers: corsHeaders });
+      try { return cachedAudioResponse(cached.audio_base64, request); }
+      catch { return new Response("Invalid cached audio", { status: 422, headers: corsHeaders }); }
+    }
     const input = normalizeSpeakInput(await request.json<SpeakInput>());
     const inputError = getSpeakInputError(input.text);
     if (inputError) return Response.json({ success: false, error: inputError }, { status: 400 });
@@ -2963,7 +3031,7 @@ export class VoiceAudioCache extends DurableObject<Env> {
     }
   }
 
-  private async readOrGenerate(input: SpeakInput): Promise<AudioResult> {
+  private async readCached(): Promise<AudioResult | undefined> {
     const count = await this.ctx.storage.get<number>("chunks");
     if (count !== undefined) {
       const pieces: string[] = [];
@@ -2974,6 +3042,12 @@ export class VoiceAudioCache extends DurableObject<Env> {
       }
       return { ...JSON.parse(pieces.join("")), cache_status: "HIT" };
     }
+    return undefined;
+  }
+
+  private async readOrGenerate(input: SpeakInput): Promise<AudioResult> {
+    const cached = await this.readCached();
+    if (cached) return cached;
     const result = await generateUncachedAudio(this.env, input);
     if (result.success && result.audio_base64) {
       const serialized = JSON.stringify(result);
@@ -3102,6 +3176,53 @@ async function getVoiceAudioCacheRequest(origin: string, env: Env, input: SpeakI
   return new Request(new URL(`/__voice-mcp/audio/${key}`, origin).toString(), { method: "GET" });
 }
 
+function inspectEncodedAudio(value: string): { bytes: Uint8Array; mime: string } {
+  const encoded = value.replace(/\s/g, "");
+  if (!encoded || encoded.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error("Invalid audio base64");
+  const bytes = base64ToBytes(encoded);
+  if (bytes.length < 16) throw new Error("Audio payload is too short");
+  const signature = String.fromCharCode(...bytes.slice(0, 12));
+  let mime: string;
+  if (signature.startsWith("ID3") || (bytes[0] === 0xff && (bytes[1] & 0xe6) === 0xe2)) mime = "audio/mpeg";
+  else if (signature.startsWith("RIFF") && signature.slice(8) === "WAVE") mime = "audio/wav";
+  else if (signature.startsWith("OggS")) mime = "audio/ogg";
+  else if (signature.slice(4, 8) === "ftyp") mime = "audio/mp4";
+  else if (signature.startsWith("fLaC")) mime = "audio/flac";
+  else throw new Error("Unsupported audio container");
+  return { bytes, mime };
+}
+
+function cachedAudioResponse(encoded: string, request: Request): Response {
+  const { bytes, mime } = inspectEncodedAudio(encoded);
+  const headers = new Headers({
+    ...corsHeaders, "Content-Type": mime, "Accept-Ranges": "bytes",
+    "Cache-Control": "private, max-age=31536000, immutable",
+    "Content-Length": String(bytes.length),
+    "X-Content-Type-Options": "nosniff",
+  });
+  let start = 0, end = bytes.length - 1, status = 200;
+  const range = request.headers.get("Range");
+  if (range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!match || (!match[1] && !match[2])) {
+      headers.set("Content-Range", `bytes */${bytes.length}`);
+      headers.set("Content-Length", "0");
+      return new Response(null, { status: 416, headers });
+    }
+    start = match[1] ? Number(match[1]) : Math.max(0, bytes.length - Number(match[2]));
+    end = match[1] && match[2] ? Math.min(Number(match[2]), bytes.length - 1) : bytes.length - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= bytes.length || end < start) {
+      headers.set("Content-Range", `bytes */${bytes.length}`);
+      headers.set("Content-Length", "0");
+      return new Response(null, { status: 416, headers });
+    }
+    status = 206;
+    headers.set("Content-Range", `bytes ${start}-${end}/${bytes.length}`);
+    headers.set("Content-Length", String(end - start + 1));
+  }
+  return new Response(request.method === "HEAD" ? null : bytes.slice(start, end + 1), { status, headers });
+}
+
 function audioResponse(audioBase64: string, cacheControl?: string): Response {
   const binaryString = atob(audioBase64);
   const bytes = new Uint8Array(binaryString.length);
@@ -3161,7 +3282,7 @@ async function readLatestVoiceEvent(origin: string): Promise<VoiceEvent | null> 
 
 function createVoiceServer(env: Env, origin: string): McpServer {
   const botName = env.BOT_NAME || 'AI';
-  const PLAYER_HTML = getPlayerHTML(botName);
+  const PLAYER_HTML = getPlayerHTML(botName, origin);
 
   const server = new McpServer({
     name: "voice-mcp",
@@ -3175,16 +3296,20 @@ function createVoiceServer(env: Env, origin: string): McpServer {
   } as unknown as Parameters<typeof server.server.registerCapabilities>[0];
   server.server.registerCapabilities(uiCapabilities);
 
-  server.resource(
-    VOICE_RESOURCE_URI,
-    VOICE_RESOURCE_URI,
+  for (const resourceUri of [VOICE_RESOURCE_URI, "ui://voice-mcp/player.html"]) server.resource(
+    resourceUri,
+    resourceUri,
     { mimeType: EXT_APPS_MIME, description: "Voice Player" },
     async () => ({
       contents: [
         {
-          uri: VOICE_RESOURCE_URI,
+          uri: resourceUri,
           mimeType: EXT_APPS_MIME,
           text: PLAYER_HTML,
+          _meta: {
+            ui: { csp: { connectDomains: [origin], resourceDomains: [origin] } },
+            "openai/widgetCSP": { connect_domains: [origin], resource_domains: [origin] },
+          },
         },
       ],
     }),
@@ -3228,6 +3353,13 @@ function createVoiceServer(env: Env, origin: string): McpServer {
           console.error("Failed to store latest voice event", error);
         }
 
+        const key = await getVoiceAudioCacheKey(env, input);
+        let info: { bytes: Uint8Array; mime: string };
+        try { info = inspectEncodedAudio(result.audio_base64); }
+        catch {
+          return { isError: true, content: [{ type: "text" as const, text: "Audio data is invalid; synthesis was not retried." }],
+            structuredContent: { error: "音频数据无效；没有重新生成扣额度。" } };
+        }
         return {
           content: [
             { type: "text" as const, text: `🎙️ ${botName} says: "${text}"` },
@@ -3235,6 +3367,9 @@ function createVoiceServer(env: Env, origin: string): McpServer {
           structuredContent: {
             text: text,
             audio_base64: result.audio_base64,
+            audio_url: new URL(`/audio/${key}`, origin).toString(),
+            audio_mime_type: info.mime,
+            audio_byte_length: info.bytes.length,
           },
         };
       }
@@ -3259,8 +3394,9 @@ function createVoiceServer(env: Env, origin: string): McpServer {
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, Range',
+  'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
 };
 
 export default {
@@ -3270,6 +3406,17 @@ export default {
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
+    }
+
+    const audioMatch = /^\/audio\/([a-f0-9]{64})$/.exec(path);
+    if (audioMatch) {
+      if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed", { status: 405, headers: corsHeaders });
+      try {
+        const stub = env.VOICE_AUDIO_CACHE.get(env.VOICE_AUDIO_CACHE.idFromName(audioMatch[1]));
+        return await stub.fetch(new Request("https://voice-cache/audio", { method: request.method, headers: request.headers }));
+      } catch {
+        return new Response("Audio cache unavailable; synthesis was not retried", { status: 503, headers: corsHeaders });
+      }
     }
 
     // MCP Endpoint
@@ -3352,6 +3499,7 @@ export default {
         ...getTtsStatus(env),
         version: '1.0.0',
         audio_cache: env.VOICE_AUDIO_CACHE ? 'persistent' : 'unavailable',
+        playback_version: '1.0.2',
       }, { headers: corsHeaders });
     }
 
