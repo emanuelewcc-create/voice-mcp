@@ -33,6 +33,8 @@ export interface Env {
   ELEVENLABS_LANGUAGE_CODE_ZH?: string;
   ELEVENLABS_LANGUAGE_CODE_EN?: string;
   ELEVENLABS_STABILITY?: string;
+  ELEVENLABS_STABILITY_ZH?: string;
+  ELEVENLABS_DELIVERY_ZH?: string;
   ELEVENLABS_SIMILARITY_BOOST?: string;
   ELEVENLABS_STYLE?: string;
   ELEVENLABS_USE_SPEAKER_BOOST?: string;
@@ -2193,9 +2195,20 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return undefined;
 }
 
-function getElevenLabsVoiceSettings(env: Env): Record<string, number | boolean> {
+// Conservative script detection: skip Japanese/korean and mixed-language passages.
+// This only selects delivery settings; it never changes the voice ID or spoken words.
+function usesChineseDelivery(input: SpeakInput): boolean {
+  const speech = stripVoiceSfxDirectives(input.text).replace(/\[[^\]\r\n]*\]/g, "");
+  return /[\u3400-\u9fff\uf900-\ufaff]/.test(speech)
+    && !/[\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f\uac00-\ud7af]/.test(speech);
+}
+
+function getElevenLabsVoiceSettings(env: Env, input?: SpeakInput): Record<string, number | boolean> {
   const settings: Record<string, number | boolean> = {};
-  const stability = parseOptionalNumber(env.ELEVENLABS_STABILITY);
+  const chineseStability = input && usesChineseDelivery(input)
+    ? parseOptionalNumber(env.ELEVENLABS_STABILITY_ZH) : undefined;
+  const stability = chineseStability !== undefined && chineseStability >= 0 && chineseStability <= 1
+    ? chineseStability : parseOptionalNumber(env.ELEVENLABS_STABILITY);
   const similarityBoost = parseOptionalNumber(env.ELEVENLABS_SIMILARITY_BOOST);
   const style = parseOptionalNumber(env.ELEVENLABS_STYLE);
   const useSpeakerBoost = parseOptionalBoolean(env.ELEVENLABS_USE_SPEAKER_BOOST);
@@ -2260,7 +2273,7 @@ function hasAudioTags(text: string): boolean {
 function normalizeSpeakInput(input: SpeakInput): SpeakInput {
   return {
     ...input,
-    raw_tags: input.raw_tags ?? hasAudioTags(stripVoiceSfxDirectives(input.text)),
+    raw_tags: input.raw_tags ?? (hasAudioTags(stripVoiceSfxDirectives(input.text)) ? true : undefined),
   };
 }
 
@@ -2528,7 +2541,15 @@ function buildElevenLabsText(env: Env, input: SpeakInput): string {
   const text = stripAudioTags(inputText);
   const tag = input.style ? ELEVENLABS_STYLE_TAGS[input.style.trim().toLowerCase()] : undefined;
 
-  return tag ? `${tag} ${text}` : text;
+  const directedText = tag ? `${tag} ${text}` : text;
+  // Caller-supplied styles/tags take priority. An explicit false opts out of the
+  // fallback, so neutral readings remain possible without changing the voice.
+  const direction = env.ELEVENLABS_DELIVERY_ZH?.trim();
+  if (direction && input.raw_tags !== false && !input.style?.trim()
+      && usesChineseDelivery(input) && !/\[[^\]\r\n]*\]/.test(inputText)) {
+    return `[${direction}] ${directedText}`;
+  }
+  return directedText;
 }
 
 function arrayBufferToBase64(arrayBuffer: ArrayBuffer): string {
@@ -2622,7 +2643,7 @@ async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<Aud
     const modelId = getElevenLabsModel(env);
     const outputFormat = getElevenLabsOutputFormat(env);
     const finalText = buildElevenLabsText(env, input);
-    const voiceSettings = getElevenLabsVoiceSettings(env);
+    const voiceSettings = getElevenLabsVoiceSettings(env, input);
     console.log("ElevenLabs TTS request", JSON.stringify({
       model_id: modelId,
       text: finalText,
@@ -2972,6 +2993,8 @@ function getTtsStatus(env: Env): Record<string, unknown> {
         en: env.ELEVENLABS_LANGUAGE_CODE_EN || (env.ELEVENLABS_VOICE_ID_EN ? "en" : ""),
       },
       voice_settings: getElevenLabsVoiceSettings(env),
+      voice_settings_zh: getElevenLabsVoiceSettings(env, { text: "你好" }),
+      delivery_zh: env.ELEVENLABS_DELIVERY_ZH || "",
     };
   }
 
@@ -3027,8 +3050,14 @@ async function getVoiceAudioCacheKey(env: Env, input: SpeakInput): Promise<strin
     voice: provider === "elevenlabs" ? voiceSelection?.voiceId : env.VOICE_ID,
     language_code: voiceSelection?.languageCode,
     output_format: provider === "elevenlabs" ? getElevenLabsOutputFormat(env) : "mp3_24000",
-    voice_settings: provider === "elevenlabs" ? getElevenLabsVoiceSettings(env) : undefined,
-    input: { text: input.text, style: input.style || undefined, raw_tags: input.raw_tags },
+    voice_settings: provider === "elevenlabs" ? getElevenLabsVoiceSettings(env, input) : undefined,
+    input: { text: input.text, style: input.style || undefined, raw_tags: input.raw_tags ?? false },
+    // Keep old cache keys for unaffected requests, but never reuse old audio
+    // when this Chinese delivery fallback changes the synthesis text.
+    chinese_delivery: provider === "elevenlabs" && usesChineseDelivery(input)
+      && env.ELEVENLABS_DELIVERY_ZH
+      && buildElevenLabsText(env, input) !== buildElevenLabsText({ ...env, ELEVENLABS_DELIVERY_ZH: undefined }, input)
+      ? env.ELEVENLABS_DELIVERY_ZH.trim() : undefined,
   });
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(fingerprint));
   const key = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
