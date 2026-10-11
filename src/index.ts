@@ -352,10 +352,33 @@ function getPlayerHTML(botName: string): string {
       }, 150);
     }
     
+    let completed = false;
+    let lastAudio = null;
+    let bridgeReady = false;
+    let lastHeight = 0;
+    function notifySize() {
+      const height = Math.ceil(document.documentElement.scrollHeight);
+      if (bridgeReady && height !== lastHeight) {
+        lastHeight = height;
+        sendToHost('ui/notifications/size-changed', { height: height });
+      }
+    }
     function handleData(data) {
-      if (data.error) { showError(data.error); return; }
-      if (data.audio_base64 && data.text) {
+      if (!data || typeof data !== 'object') return;
+      if (data.error && !lastAudio) {
+        completed = true;
+        showError(String(data.error));
+        notifySize();
+        return;
+      }
+      if (typeof data.audio_base64 === 'string' && data.audio_base64 && typeof data.text === 'string') {
+        completed = true;
+        if (lastAudio === data.audio_base64) return;
+        lastAudio = data.audio_base64;
+        if (audio) audio.pause();
+        if (waveInterval) clearInterval(waveInterval);
         renderPlayer(data.text, data.audio_base64);
+        notifySize();
       }
     }
     
@@ -366,12 +389,21 @@ function getPlayerHTML(botName: string): string {
     }
     
     window.addEventListener('message', function(event) {
+      if (event.source !== window.parent) return;
       const msg = event.data;
       if (!msg || typeof msg !== 'object') return;
       
       if (msg.jsonrpc === '2.0') {
+        if (msg.id === 1 && msg.result && !bridgeReady) {
+          bridgeReady = true;
+          sendToHost('ui/notifications/initialized', {});
+          notifySize();
+        }
+        if (msg.id === 1 && msg.error && !completed) {
+          showError('Player connection failed. Reopen this message to retry.');
+        }
         if (msg.method === 'ui/notifications/tool-input') {
-          contentEl.innerHTML = '<div class="loading">Generating voice...</div>';
+          if (!completed) contentEl.innerHTML = '<div class="loading">Generating voice...</div>';
         }
         if (msg.method === 'ui/notifications/tool-result') {
           const structured = msg.params?.structuredContent;
@@ -381,8 +413,23 @@ function getPlayerHTML(botName: string): string {
       if (msg.structuredContent) handleData(msg.structuredContent);
     });
     
-    sendToHost('ui/initialize', { name: 'voice-mcp', version: '1.0.0' }, 1);
-    setTimeout(function() { sendToHost('ui/notifications/initialized', {}); }, 50);
+    // ChatGPT may restore an existing result before the iframe registers its listener.
+    window.addEventListener('openai:set_globals', function(event) {
+      handleData(event.detail?.globals?.toolOutput);
+    });
+    handleData(window.openai?.toolOutput);
+    window.addEventListener('pageshow', function() {
+      handleData(window.openai?.toolOutput);
+      notifySize();
+    });
+    if (typeof ResizeObserver !== 'undefined') {
+      new ResizeObserver(notifySize).observe(document.body);
+    }
+    sendToHost('ui/initialize', {
+      appInfo: { name: 'voice-mcp', version: '1.0.1' },
+      appCapabilities: { availableDisplayModes: ['inline'] },
+      protocolVersion: '2026-01-26'
+    }, 1);
   </script>
 </body>
 </html>`;
