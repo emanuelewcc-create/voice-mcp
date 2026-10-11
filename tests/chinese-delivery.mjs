@@ -4,15 +4,24 @@ import { runInNewContext } from "node:vm";
 import { webcrypto } from "node:crypto";
 import ts from "typescript";
 import test from "node:test";
+import { z } from "zod";
 
 const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
 function loadWorker(text) {
   const requests = [];
+  class MockMcpServer {
+    tools = [];
+    server = { registerCapabilities() {} };
+    resource() {}
+    registerTool(name, definition) { this.tools.push({name, ...definition}); }
+  }
   const runtime = {
     exports: {}, crypto: webcrypto, TextEncoder, URL, Response, atob, btoa,
     console: { log() {}, error() {} },
     require(id) {
       if (id === "cloudflare:workers") return { DurableObject: class {} };
+      if (id === "@modelcontextprotocol/sdk/server/mcp.js") return { McpServer: MockMcpServer };
+      if (id === "zod") return { z };
       return {};
     },
     async fetch(url, options) {
@@ -23,13 +32,15 @@ function loadWorker(text) {
   const js = ts.transpileModule(text, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText;
-  runInNewContext(js + "\nexports.helpers = { normalizeSpeakInput, generateElevenLabsAudio, getVoiceAudioCacheKey, getTtsStatus };", runtime);
+  runInNewContext(js + "\nexports.helpers = { normalizeSpeakInput, generateElevenLabsAudio, getVoiceAudioCacheKey, getTtsStatus, createVoiceServer, getPlayerHTML };", runtime);
   const h = runtime.exports.helpers;
   return {
     requests,
     async synth(env, input) { return h.generateElevenLabsAudio(env, h.normalizeSpeakInput(input)); },
     key(env, input) { return h.getVoiceAudioCacheKey(env, h.normalizeSpeakInput(input)); },
-    status: h.getTtsStatus
+    status: h.getTtsStatus,
+    tool(env) { return h.createVoiceServer(env, "https://voice.test").tools.find(tool => tool.name === "speak"); },
+    player() { return h.getPlayerHTML("Test", "https://voice.test"); }
   };
 }
 const w = loadWorker(source);
@@ -42,6 +53,18 @@ const tuned = {
   ...base, ELEVENLABS_STABILITY_ZH: "0.25",
   ELEVENLABS_DELIVERY_ZH: "relaxed, conversational, unhurried"
 };
+
+test("shared tool guidance retains the original expressive-tag contract; Chinese presets stay language-scoped", () => {
+  const tool = w.tool(base);
+  assert.equal(tool.description, "Make AI speak with a custom cloned voice. The audio will play in an inline player.");
+  const schema = tool.inputSchema.shape;
+  assert.equal(schema.text.description, "Text to speak");
+  assert.equal(schema.raw_tags.description, "Allow raw ElevenLabs v3/v4 audio tags when supported");
+  assert.match(schema.style.description, /^Optional speaking style\. Chinese only:/);
+  assert.match(schema.style.description, /natural_close_zh.*intimate_zh/);
+  assert.match(schema.style.description, /120 characters/);
+  assert.match(schema.style.description, /do not apply to English or Japanese/);
+});
 
 test("oversized Chinese style fails before the provider request, without a paid retry", async () => {
   const beforeCount = w.requests.length;
@@ -246,6 +269,12 @@ test("invalid Chinese stability safely falls back and status reports both profil
 if (process.env.VOICE_BASELINE_SOURCE) {
   test("regression: original deployed source produces identical non-Chinese payloads and cache keys", async () => {
     const old = loadWorker(readFileSync(process.env.VOICE_BASELINE_SOURCE, "utf8"));
+    const deployed = {...JSON.parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8")).vars, ELEVENLABS_API_KEY:"mock-key"};
+    const oldEnv = {...deployed, ELEVENLABS_STABILITY_ZH:undefined, ELEVENLABS_DELIVERY_ZH:undefined};
+    const beforeTool = old.tool(oldEnv), afterTool = w.tool(deployed);
+    assert.equal(afterTool.description, beforeTool.description);
+    assert.equal(afterTool.inputSchema.shape.text.description, beforeTool.inputSchema.shape.text.description);
+    assert.equal(afterTool.inputSchema.shape.raw_tags.description, beforeTool.inputSchema.shape.raw_tags.description);
     for (const input of [
       { text: "Stay with me a little longer." },
       { text: "今日はもう少し一緒にいて。" },
@@ -257,11 +286,33 @@ if (process.env.VOICE_BASELINE_SOURCE) {
       { text: "[softly] 今日はもう少し一緒にいて。", raw_tags: true }
       ,{ text: "Stay with me.", style: "intimate_zh", raw_tags:false }
       ,{ text: "今日はもう少し一緒にいて。", style: "natural_close_zh", raw_tags:false }
+      ,{ text: "[soft, a little teasing] Stay a little longer. [quiet laugh] There is no hurry.", raw_tags:true }
+      ,{ text: "[low and close, unhurried] ねえ、もう少しここにいて。 [small laugh]", raw_tags:true }
+      ,{ text: "Come sit here.", style:"laughing" }
+      ,{ text: "ねえ、今日はどうだった？", style:"teasing" }
     ]) {
-      await old.synth(base, input);
-      await w.synth(tuned, input);
+      await old.synth(oldEnv, input);
+      await w.synth(deployed, input);
       assert.deepEqual(w.requests.at(-1), old.requests.at(-1));
-      assert.equal(await w.key(tuned, input), await old.key(base, input));
+      assert.equal(await w.key(deployed, input), await old.key(oldEnv, input));
+    }
+  });
+}
+
+if (process.env.VOICE_PREVIOUS_SOURCE) {
+  test("language-guidance rollback preserves Chinese requests, cache keys, settings and the repaired player", async () => {
+    const previous = loadWorker(readFileSync(process.env.VOICE_PREVIOUS_SOURCE, "utf8"));
+    const env = {...JSON.parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8")).vars, ELEVENLABS_API_KEY:"mock-key"};
+    assert.equal(w.player(), previous.player());
+    assert.deepEqual(JSON.parse(JSON.stringify(w.status(env))), JSON.parse(JSON.stringify(previous.status(env))));
+    for (const style of [undefined, "soft", "teasing", "natural_close_zh", "intimate_zh", "gentle and affectionate"]) {
+      for (const raw_tags of [undefined, true, false]) {
+        const input = {text:"今天累不累？先坐下歇一会儿。", style, raw_tags};
+        await previous.synth(env, input);
+        await w.synth(env, input);
+        assert.deepEqual(w.requests.at(-1), previous.requests.at(-1));
+        assert.equal(await w.key(env, input), await previous.key(env, input));
+      }
     }
   });
 }
