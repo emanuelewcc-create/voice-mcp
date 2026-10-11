@@ -2724,6 +2724,8 @@ async function generateDashScopeAudio(env: Env, input: SpeakInput): Promise<Audi
 
 async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<AudioResult> {
   try {
+    const deliveryError = getVoiceDeliveryError(env, input);
+    if (deliveryError) return { success: false, error: deliveryError };
     const apiKey = env.ELEVENLABS_API_KEY;
     const voiceSelection = resolveElevenLabsVoice(env, input);
 
@@ -3013,7 +3015,7 @@ export class VoiceAudioCache extends DurableObject<Env> {
       catch { return new Response("Invalid cached audio", { status: 422, headers: corsHeaders }); }
     }
     const input = normalizeSpeakInput(await request.json<SpeakInput>());
-    const inputError = getSpeakInputError(input.text);
+    const inputError = getSpeakInputError(input.text) || getVoiceDeliveryError(this.env, input);
     if (inputError) return Response.json({ success: false, error: inputError }, { status: 400 });
     const coalesced = Boolean(this.pending);
     if (!this.pending) {
@@ -3066,6 +3068,8 @@ export class VoiceAudioCache extends DurableObject<Env> {
 }
 
 async function generateAudio(env: Env, input: SpeakInput): Promise<AudioResult> {
+  const deliveryError = getVoiceDeliveryError(env, input);
+  if (deliveryError) return { success: false, error: deliveryError };
   // Never fall back to paid synthesis if persistent storage is unavailable.
   const key = await getVoiceAudioCacheKey(env, input);
   const stub = env.VOICE_AUDIO_CACHE.get(env.VOICE_AUDIO_CACHE.idFromName(key));
@@ -3140,6 +3144,19 @@ function getSpeakInputError(text: string): string | undefined {
     return "No speakable text";
   }
 
+  return undefined;
+}
+
+// An application limit, not a provider API limit: Chinese delivery cues should
+// be short phrases, not entire directing paragraphs embedded in one audio tag.
+// Validate the effective provider text before *any* cache lookup or paid call.
+function getVoiceDeliveryError(env: Env, input: SpeakInput): string | undefined {
+  if (getTtsProvider(env) !== "elevenlabs" || !usesChineseDelivery(input)
+      || !supportsElevenLabsAudioTags(getElevenLabsModel(env))) return undefined;
+  const tags = Array.from(buildElevenLabsText(env, input).matchAll(/\[([^\]\r\n]*)\]/g));
+  if (tags.some((tag) => tag[1].length > 160)) {
+    return "Chinese delivery instructions are too long. Use one brief style direction (up to 120 characters), e.g. relaxed, conversational, warm. No audio was generated. Do not retry automatically.";
+  }
   return undefined;
 }
 
@@ -3322,7 +3339,7 @@ function createVoiceServer(env: Env, origin: string): McpServer {
       description: `Make ${botName} speak with the configured voice. The audio will play in an inline player. For Chinese, use natural everyday wording and put a brief delivery direction in style, leaving text as the words to say. The Chinese preset favors relaxed, private conversation. Do not request narrator/actor delivery or add repeated names, warm-up syllables, forced breaths or laughs. Do not repeat a successful call just to obtain a different delivery.`,
       inputSchema: z.object({
         text: z.string().describe("Words to speak exactly once. For Chinese, prefer plain dialogue; put delivery guidance in style rather than adding a lead-in or repeating the first word."),
-        style: z.string().optional().describe("For Chinese: a short delivery-only direction, preferably in English, e.g. gentle and affectionate. Do not include dialogue, speaker names or quoted words. Omit to use the Chinese conversational preset. For other languages: soft, teasing, excited, tired, laughing or curious."),
+        style: z.string().optional().describe("For Chinese: one brief delivery direction, up to 120 characters, e.g. relaxed, conversational, warm. Do not send directing paragraphs, negative-prompt lists, dialogue, speaker names or quoted words. Omit to use the Chinese conversational preset. For other languages: soft, teasing, excited, tired, laughing or curious."),
         raw_tags: z.boolean().optional().describe("Allow raw ElevenLabs v3/v4 audio tags when supported"),
       }),
       _meta: {
@@ -3332,9 +3349,10 @@ function createVoiceServer(env: Env, origin: string): McpServer {
     },
     async ({ text, style, raw_tags }) => {
       const input = normalizeSpeakInput({ text, style, raw_tags });
-      const inputError = getSpeakInputError(input.text);
+      const inputError = getSpeakInputError(input.text) || getVoiceDeliveryError(env, input);
       if (inputError) {
         return {
+          isError: true,
           content: [
             { type: "text" as const, text: `Voice generation skipped: ${inputError}` },
           ],
@@ -3500,6 +3518,7 @@ export default {
         version: '1.0.0',
         audio_cache: env.VOICE_AUDIO_CACHE ? 'persistent' : 'unavailable',
         playback_version: '1.0.2',
+        delivery_validation_version: '1.0.1',
       }, { headers: corsHeaders });
     }
 
@@ -3553,6 +3572,10 @@ export default {
         style,
         raw_tags: rawTags,
       });
+      const deliveryError = getVoiceDeliveryError(env, input);
+      if (deliveryError) {
+        return Response.json({ error: deliveryError }, { status: 400, headers: corsHeaders });
+      }
       const cacheRequest = await getVoiceAudioCacheRequest(url.origin, env, input);
       const cachedResponse = await caches.default.match(cacheRequest);
       if (cachedResponse) {
