@@ -3,11 +3,14 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-04-01",
   "compatibility_flags": ["nodejs_compat"],
+  "keep_vars": true,
   "durable_objects": {
     "bindings": [{ "name": "VOICE_AUDIO_CACHE", "class_name": "VoiceAudioCache" }]
   },
   "migrations": [{ "tag": "voice-audio-cache-v1", "new_sqlite_classes": ["VoiceAudioCache"] }],
   "vars": {
+    "TTS_PROVIDER": "elevenlabs",
+    "ELEVENLABS_VOICE_ID": "7Pd7lr5kXhWerGi0OVF0",
     "ELEVENLABS_MODEL_ID": "eleven_v4",
     "VOICE_SFX_URL": "https://haven.rain4haven99.cyou/api/voice-sfx/mix"
   },
