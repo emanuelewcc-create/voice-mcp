@@ -2598,6 +2598,43 @@ const CHINESE_STYLE_DIRECTIONS: Record<string, string> = {
   curious: "gently curious",
 };
 
+interface ChineseDeliveryPreset {
+  id: string;
+  revision: number;
+  cues: readonly string[];
+}
+
+// These are delivery cues for the existing voice, not a Voice Design prompt.
+// The speech API has no free-form style-description field. Compile the preset
+// to a bounded set of short v3/v4 audio tags; never insert a directing paragraph.
+const NATURAL_CLOSE_ZH: ChineseDeliveryPreset = {
+  id: "natural_close_zh",
+  revision: 1,
+  cues: [
+    "close-mic, soft-spoken",
+    "lightly breathy, relaxed articulation",
+    "natural pauses, easy conversational rhythm",
+    "subtly teasing smile, light phrase-end vocal fry",
+  ],
+};
+const CHINESE_DELIVERY_PRESETS: Record<string, ChineseDeliveryPreset> = {
+  natural_close_zh: NATURAL_CLOSE_ZH,
+  intimate_zh: NATURAL_CLOSE_ZH,
+};
+
+function usesExplicitAudioTags(env: Env, input: SpeakInput): boolean {
+  return (input.raw_tags === true || (input.raw_tags !== false && Boolean(env.ELEVENLABS_DELIVERY_ZH) && usesChineseDelivery(input)))
+    && /\[[^\]\r\n]*\]/.test(stripVoiceSfxDirectives(input.text));
+}
+
+function getAppliedChinesePreset(env: Env, input: SpeakInput): ChineseDeliveryPreset | undefined {
+  if (getTtsProvider(env) !== "elevenlabs" || !usesChineseDelivery(input)
+      || !supportsElevenLabsAudioTags(getElevenLabsModel(env)) || usesExplicitAudioTags(env, input)) return undefined;
+  const name = input.style?.trim().toLowerCase();
+  return name && Object.prototype.hasOwnProperty.call(CHINESE_DELIVERY_PRESETS, name)
+    ? CHINESE_DELIVERY_PRESETS[name] : undefined;
+}
+
 function getChineseStyleDirection(style?: string): string | undefined {
   if (!style?.trim()) return undefined;
   // Accept the plugin's style field with or without brackets. Collapse duplicate
@@ -2618,9 +2655,17 @@ function buildElevenLabsText(env: Env, input: SpeakInput): string {
     return stripAudioTags(inputText);
   }
 
-  if ((input.raw_tags === true || (input.raw_tags !== false && env.ELEVENLABS_DELIVERY_ZH && usesChineseDelivery(input)))
-      && /\[[^\]\r\n]*\]/.test(inputText)) {
+  if (usesExplicitAudioTags(env, input)) {
     return inputText;
+  }
+
+  const preset = getAppliedChinesePreset(env, input);
+  if (preset) {
+    const text = input.raw_tags === false
+      ? inputText.replace(/\[[A-Za-z][^\]\r\n]*\]/g, "").trim() : inputText;
+    // A named preset replaces the generic Chinese fallback instead of stacking
+    // both. Keep the dialogue, voice settings, output encoding and player intact.
+    return `${preset.cues.map((cue) => `[${cue}]`).join(" ")} ${text}`;
   }
 
   const chineseProfile = env.ELEVENLABS_DELIVERY_ZH?.trim();
@@ -3106,6 +3151,8 @@ function getTtsStatus(env: Env): Record<string, unknown> {
       voice_settings: getElevenLabsVoiceSettings(env),
       voice_settings_zh: getElevenLabsVoiceSettings(env, { text: "你好" }),
       delivery_zh: env.ELEVENLABS_DELIVERY_ZH || "",
+      style_presets_zh: Object.keys(CHINESE_DELIVERY_PRESETS),
+      style_max_length_zh: 120,
     };
   }
 
@@ -3153,6 +3200,13 @@ function getSpeakInputError(text: string): string | undefined {
 function getVoiceDeliveryError(env: Env, input: SpeakInput): string | undefined {
   if (getTtsProvider(env) !== "elevenlabs" || !usesChineseDelivery(input)
       || !supportsElevenLabsAudioTags(getElevenLabsModel(env))) return undefined;
+  if ((input.style || "").trim().length > 120) {
+    return "Chinese style exceeds 120 characters. Use style: natural_close_zh for the close conversational preset, or a brief custom direction. No audio was generated. Do not retry automatically.";
+  }
+  const name = input.style?.trim().toLowerCase();
+  if (name && /^[a-z0-9_]+_zh$/.test(name) && !Object.prototype.hasOwnProperty.call(CHINESE_DELIVERY_PRESETS, name)) {
+    return "Unknown Chinese style preset. Use natural_close_zh or intimate_zh. No audio was generated.";
+  }
   const tags = Array.from(buildElevenLabsText(env, input).matchAll(/\[([^\]\r\n]*)\]/g));
   if (tags.some((tag) => tag[1].length > 160)) {
     return "Chinese delivery instructions are too long. Use one brief style direction (up to 120 characters), e.g. relaxed, conversational, warm. No audio was generated. Do not retry automatically.";
@@ -3167,6 +3221,7 @@ function getLatestVoiceCacheRequest(origin: string): Request {
 async function getVoiceAudioCacheKey(env: Env, input: SpeakInput): Promise<string> {
   const provider = getTtsProvider(env);
   const voiceSelection = provider === "elevenlabs" ? resolveElevenLabsVoice(env, input) : undefined;
+  const preset = getAppliedChinesePreset(env, input);
   const fingerprint = JSON.stringify({
     version: 2,
     provider,
@@ -3175,7 +3230,10 @@ async function getVoiceAudioCacheKey(env: Env, input: SpeakInput): Promise<strin
     language_code: voiceSelection?.languageCode,
     output_format: provider === "elevenlabs" ? getElevenLabsOutputFormat(env) : "mp3_24000",
     voice_settings: provider === "elevenlabs" ? getElevenLabsVoiceSettings(env, input) : undefined,
-    input: { text: input.text, style: input.style || undefined, raw_tags: input.raw_tags ?? false },
+    input: { text: input.text, style: preset?.id || input.style || undefined, raw_tags: input.raw_tags ?? false },
+    // Alias names share the same recording. Include the effective preset so a
+    // future cue revision cannot silently replay an older delivery.
+    chinese_preset: preset,
     // Keep old cache keys for unaffected requests, but never reuse old audio
     // when this Chinese delivery fallback changes the synthesis text.
     chinese_delivery: provider === "elevenlabs" && usesChineseDelivery(input)
@@ -3339,8 +3397,8 @@ function createVoiceServer(env: Env, origin: string): McpServer {
       description: `Make ${botName} speak with the configured voice. The audio will play in an inline player. For Chinese, use natural everyday wording and put a brief delivery direction in style, leaving text as the words to say. The Chinese preset favors relaxed, private conversation. Do not request narrator/actor delivery or add repeated names, warm-up syllables, forced breaths or laughs. Do not repeat a successful call just to obtain a different delivery.`,
       inputSchema: z.object({
         text: z.string().describe("Words to speak exactly once. For Chinese, prefer plain dialogue; put delivery guidance in style rather than adding a lead-in or repeating the first word."),
-        style: z.string().optional().describe("For Chinese: one brief delivery direction, up to 120 characters, e.g. relaxed, conversational, warm. Do not send directing paragraphs, negative-prompt lists, dialogue, speaker names or quoted words. Omit to use the Chinese conversational preset. For other languages: soft, teasing, excited, tired, laughing or curious."),
-        raw_tags: z.boolean().optional().describe("Allow raw ElevenLabs v3/v4 audio tags when supported"),
+        style: z.string().optional().describe("For close, expressive Chinese conversation use natural_close_zh (alias: intimate_zh). This server preset adds close soft speech, light breath, relaxed articulation, natural pauses and a subtle teasing smile to the existing voice. Pass plain dialogue as text. Custom Chinese style is limited to 120 characters; never send directing paragraphs. Omit for the generic Chinese default. Other languages retain soft, teasing, excited, tired, laughing or curious."),
+        raw_tags: z.boolean().optional().describe("Control audio tags in text. false removes caller-written tags; it does not disable an explicit style or server preset. Named Chinese presets work with plain text and raw_tags=false. Explicit positional tags take precedence when allowed."),
       }),
       _meta: {
         ui: { resourceUri: VOICE_RESOURCE_URI },
@@ -3518,7 +3576,7 @@ export default {
         version: '1.0.0',
         audio_cache: env.VOICE_AUDIO_CACHE ? 'persistent' : 'unavailable',
         playback_version: '1.0.2',
-        delivery_validation_version: '1.0.1',
+        delivery_validation_version: '1.1.0',
       }, { headers: corsHeaders });
     }
 
